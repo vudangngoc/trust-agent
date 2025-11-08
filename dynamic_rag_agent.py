@@ -1,7 +1,6 @@
 from llama_index.core import VectorStoreIndex, Settings, PromptTemplate, Document
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.ollama import Ollama
-from llama_index.core.query_engine import CustomQueryEngine
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.storage import StorageContext
@@ -453,8 +452,11 @@ def run_agent():
         # Step 5: Retrieve and query
         retriever = VectorIndexRetriever(index=index, similarity_top_k=3)
         postprocessor = SimilarityPostprocessor(similarity_cutoff=0.7)
-        query_engine = CustomQueryEngine.from_defaults(
-            retriever=retriever, node_postprocessors=[postprocessor], system_prompt=system_prompt
+        # Use index.as_query_engine for simpler API with system prompt support
+        query_engine = index.as_query_engine(
+            retriever=retriever,
+            node_postprocessors=[postprocessor],
+            system_prompt=system_prompt
         )
         try:
             response = query_engine.query(user_query)
