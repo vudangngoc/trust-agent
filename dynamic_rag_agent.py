@@ -1,17 +1,12 @@
-import pandas as pd
-from llama_index.core import VectorStoreIndex, Settings, PromptTemplate
-from llama_index.core.tools import FunctionTool  # Only if you plan to use tools later
+from llama_index.core import VectorStoreIndex, Settings, PromptTemplate, Document
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.core.query_engine import CustomQueryEngine
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.storage import StorageContext
-from llama_index.core.readers import SimpleDirectoryReader
-from llama_index.core.agent import ReActAgent
 import chromadb
 import requests
-from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler
 import whois
 import re
@@ -19,6 +14,7 @@ from typing import List, Dict
 from llama_index.vector_stores.chroma import ChromaVectorStore
 import json
 from urllib.parse import urlparse
+from datetime import datetime
 
 # Configure local components
 Settings.embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -46,9 +42,27 @@ class TrustAgent:
         try:
             domain = re.sub(r"https?://(www\.)?", "", url).split('/')[0]
             w = whois.whois(domain)
-            age = (2025 - int(w.creation_date[0].year)) if w.creation_date else 0  # Approx for 2025
-            return f"Age: {age}yrs, Registrar: {w.registrar}, HTTPS: {requests.head(url, timeout=5).headers.get('Strict-Transport-Security', 'No')}"
-        except:
+            age = 0
+            if w.creation_date:
+                if isinstance(w.creation_date, list):
+                    creation_year = w.creation_date[0].year if w.creation_date[0] else None
+                else:
+                    creation_year = w.creation_date.year if hasattr(w.creation_date, 'year') else None
+                if creation_year:
+                    age = datetime.now().year - int(creation_year)
+            
+            registrar = w.registrar if hasattr(w, 'registrar') and w.registrar else "Unknown"
+            
+            # Check HTTPS with timeout
+            try:
+                https_check = requests.head(url, timeout=5, allow_redirects=True)
+                hsts = https_check.headers.get('Strict-Transport-Security', 'No')
+            except Exception:
+                hsts = "Unknown"
+            
+            return f"Age: {age}yrs, Registrar: {registrar}, HTTPS: {hsts}"
+        except Exception as e:
+            print(f"DEBUG: Domain info error for {url}: {e}")
             return "Unknown domain info"
     
     def heuristic_score(self, url: str, query: str) -> Dict:
@@ -99,7 +113,6 @@ class TrustAgent:
                 "Output JSON only: {{'score': float, 'reason': str}}"
             )
             response = self.llm.complete(short_prompt.format(query=query, url=url))
-            import json
             # Try to extract JSON from response (handle cases where model adds extra text)
             response_text = response.text.strip()
             # Find JSON object by finding first { and matching closing }
@@ -157,13 +170,18 @@ class QueryExtractorAgent:
     def extract_and_enrich(self, query: str) -> str:
         """Extract context and return enriched search query."""
         try:
-            # Use shorter prompt for faster generation
+            # Enhanced prompt that preserves topic names and adds search enhancements
             short_prompt = PromptTemplate(
-                "Extract topic and enrich query. Query: {query}. "
+                "Extract the main topic/entity name from the query and create an enriched search query. "
+                "CRITICAL: The enriched_query MUST start with and include the exact topic/entity name from the original query. "
+                "Do NOT replace the topic name with a description or explanation. "
+                "For example, if query is 'Quarkus', enriched_query should be 'Quarkus' (with optional enhancements like 'site:quarkus.io' or 'official docs'). "
+                "If query is 'What is Quarkus?', enriched_query should be 'Quarkus' or '\"Quarkus\" official docs', NOT 'lightweight Java framework'. "
+                "Add search enhancements: site: operators for known projects (e.g., site:quarkus.io for Quarkus), quotes for exact phrases, 'official docs' for reliability. "
+                "Query: {query}. "
                 "Output JSON: {{'topic': str, 'enriched_query': str}}"
             )
             response = self.llm.complete(short_prompt.format(query=query))
-            import json
             response_text = response.text.strip()
             # Find JSON object by finding first { and matching closing }
             start_idx = response_text.find('{')
@@ -182,8 +200,17 @@ class QueryExtractorAgent:
                     data = json.loads(response_text)
             else:
                 data = json.loads(response_text)
-            print(f"DEBUG: Extracted - Topic: {data.get('topic', 'unknown')}, Enriched: {data.get('enriched_query', query)}")
-            return data.get('enriched_query', query)
+            enriched = data.get('enriched_query', query)
+            topic = data.get('topic', '').lower()
+            
+            # Validation: Ensure topic name is present in enriched query
+            # If topic is extracted but not in enriched query, prepend it
+            if topic and topic not in enriched.lower():
+                print(f"DEBUG: Topic '{topic}' not found in enriched query, prepending it")
+                enriched = f"{topic} {enriched}"
+            
+            print(f"DEBUG: Extracted - Topic: {data.get('topic', 'unknown')}, Enriched: {enriched}")
+            return enriched
         except Exception as e:
             print(f"DEBUG: Extraction failed: {e}. Using original query.")
             return query  # Fallback to raw query
@@ -268,7 +295,16 @@ def search_searxng(query, num_results=5):
                 data = response.json()
                 results = data.get("results", [])[:num_results]
                 print(f"DEBUG: Got {len(results)} results from {engine}")  # Debug
-                all_results.extend([{"title": r["title"], "url": r["url"], "content": r.get("content", "")} for r in results])
+                for r in results:
+                    try:
+                        all_results.append({
+                            "title": r.get("title", "No title"),
+                            "url": r.get("url", ""),
+                            "content": r.get("content", "")
+                        })
+                    except (KeyError, TypeError) as e:
+                        print(f"DEBUG: Error processing result: {e}")
+                        continue
             else:
                 print(f"DEBUG: Failed {engine} with status {response.status_code}")
         except requests.exceptions.RequestException as e:
@@ -310,17 +346,25 @@ def scrape_with_crawl4ai(urls: List[str], timeout_per_url: int = 30):
     
     async def scrape_all():
         """Scrape all URLs."""
-        async with AsyncWebCrawler() as crawler:
-            docs = []
+        crawler = AsyncWebCrawler()
+        docs = []
+        try:
             for url in urls:
                 result = await scrape_url(crawler, url)
-                if result and result.markdown:
+                if result and hasattr(result, 'markdown') and result.markdown:
                     # Limit document size to prevent memory issues
                     max_chars = 50000  # Limit to ~50k chars per document
                     text = result.markdown[:max_chars] if len(result.markdown) > max_chars else result.markdown
                     docs.append({"text": text, "url": url})
                     print(f"DEBUG: Scraped {url} ({len(text)} chars)")
-            return docs
+        finally:
+            # Clean up crawler if needed
+            if hasattr(crawler, 'close'):
+                try:
+                    await crawler.close()
+                except Exception:
+                    pass
+        return docs
     
     # Run async scraping with proper event loop handling
     try:
@@ -380,7 +424,10 @@ def run_agent():
             continue
 
         # Step 2: Trust filter
-        urls = [r["url"] for r in search_results]
+        urls = [r.get("url", "") for r in search_results if r.get("url")]
+        if not urls:
+            print("No valid URLs found in search results.")
+            continue
         trusted_urls = trust_agent.filter_trusted(urls, user_query)
         if not trusted_urls:
             print("Trust Agent: Insufficient reliable sources after filtering.")
@@ -392,12 +439,23 @@ def run_agent():
             print("Scraping failed.")
             continue
 
-        # Step 4: Temp index
-        temp_docs = [SimpleDirectoryReader(input_files=[{"file_path": None, "text": d["text"], "metadata": {"url": d["url"]}}]) for d in scraped_docs]
-        flat_docs = []
-        for reader in temp_docs:
-            flat_docs.extend(reader.load_data())
-        index = VectorStoreIndex.from_documents(flat_docs, storage_context=storage_context)
+        # Step 4: Create documents from scraped content
+        documents = []
+        for doc in scraped_docs:
+            try:
+                documents.append(Document(
+                    text=doc["text"],
+                    metadata={"url": doc["url"]}
+                ))
+            except Exception as e:
+                print(f"DEBUG: Error creating document for {doc.get('url', 'unknown')}: {e}")
+                continue
+        
+        if not documents:
+            print("No valid documents created from scraped content.")
+            continue
+        
+        index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
 
         # Step 5: Retrieve and query
         retriever = VectorIndexRetriever(index=index, similarity_top_k=3)
