@@ -18,7 +18,6 @@ from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.storage import StorageContext
 from llama_index.core.query_engine import BaseQueryEngine
-from llama_index.core.llms.types import LLM
 from llama_index.vector_stores.chroma import ChromaVectorStore
 import chromadb
 import requests
@@ -102,7 +101,7 @@ class TrustAgent:
         trust_prompt: Template for LLM-based trust evaluation
     """
     
-    def __init__(self, llm: LLM) -> None:
+    def __init__(self, llm: Any) -> None:
         """
         Initialize TrustAgent with an LLM instance.
         
@@ -328,7 +327,20 @@ class TrustAgent:
         return trusted
 
 class QueryExtractorAgent:
-    def __init__(self, llm):
+    """
+    Extracts and enriches user queries using LLM-based analysis.
+    
+    Preserves topic names while adding search enhancements like site: operators
+    and official documentation keywords.
+    """
+    
+    def __init__(self, llm: Any) -> None:
+        """
+        Initialize QueryExtractorAgent with an LLM instance.
+        
+        Args:
+            llm: Language model for query extraction and enrichment
+        """
         self.llm = llm
         self.extract_prompt = PromptTemplate(
             "Analyze this user query and extract: "
