@@ -22,7 +22,13 @@ from urllib.parse import urlparse
 
 # Configure local components
 Settings.embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
-Settings.llm = Ollama(model="phi3:3.8b", request_timeout=120.0)
+# Increased timeout and added max_tokens to prevent long generations
+Settings.llm = Ollama(
+    model="phi3:3.8b", 
+    request_timeout=600.0,  # Increased from 120 to 600 seconds
+    temperature=0.1,  # Lower temperature for faster, more deterministic responses
+    max_tokens=512  # Limit response length to prevent very long generations
+)
 
 # Trust Agent: Dynamic evaluator
 class TrustAgent:
@@ -87,15 +93,44 @@ class TrustAgent:
         print(f"DEBUG: Using LLM for {url}")
         domain_info = self.get_domain_info(url)
         try:
-            response = self.llm.complete(self.trust_prompt.format(query=query, url=url, domain_info=domain_info))
+            # Use a shorter, more focused prompt to reduce generation time
+            short_prompt = PromptTemplate(
+                "Score URL trust (0-1, >0.7=trusted). Query: {query}. URL: {url}. "
+                "Output JSON only: {{'score': float, 'reason': str}}"
+            )
+            response = self.llm.complete(short_prompt.format(query=query, url=url))
             import json
-            return json.loads(response.text)
+            # Try to extract JSON from response (handle cases where model adds extra text)
+            response_text = response.text.strip()
+            # Find JSON object by finding first { and matching closing }
+            start_idx = response_text.find('{')
+            if start_idx != -1:
+                brace_count = 0
+                for i in range(start_idx, len(response_text)):
+                    if response_text[i] == '{':
+                        brace_count += 1
+                    elif response_text[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_str = response_text[start_idx:i+1]
+                            return json.loads(json_str)
+            # Try parsing the whole response
+            return json.loads(response_text)
         except Exception as e:
-            print(f"DEBUG: LLM timeout for {url}: {e}. Falling back to heuristic.")
+            print(f"DEBUG: LLM timeout/error for {url}: {e}. Falling back to heuristic.")
             return self.heuristic_score(url, query)  # Graceful fallback
     
     def filter_trusted(self, urls: List[str], query: str, min_trusted: int = 2) -> List[str]:
-        scores = [(url, self.score_url(url, query)) for url in urls]
+        # Process URLs with timeout protection per URL
+        scores = []
+        for url in urls:
+            try:
+                score_data = self.score_url(url, query)
+                scores.append((url, score_data))
+            except Exception as e:
+                print(f"DEBUG: Error scoring {url}: {e}. Skipping.")
+                continue
+        
         trusted = [url for url, data in scores if data['score'] > 0.7]
         if len(trusted) < min_trusted:
             print(f"Trust Agent: Only {len(trusted)} trusted sources; need more.")
@@ -122,11 +157,33 @@ class QueryExtractorAgent:
     def extract_and_enrich(self, query: str) -> str:
         """Extract context and return enriched search query."""
         try:
-            response = self.llm.complete(self.extract_prompt.format(query=query))
+            # Use shorter prompt for faster generation
+            short_prompt = PromptTemplate(
+                "Extract topic and enrich query. Query: {query}. "
+                "Output JSON: {{'topic': str, 'enriched_query': str}}"
+            )
+            response = self.llm.complete(short_prompt.format(query=query))
             import json
-            data = json.loads(response.text)
-            print(f"DEBUG: Extracted - Topic: {data['topic']}, Intent: {data['intent']}, Enriched: {data['enriched_query']}")
-            return data['enriched_query']
+            response_text = response.text.strip()
+            # Find JSON object by finding first { and matching closing }
+            start_idx = response_text.find('{')
+            if start_idx != -1:
+                brace_count = 0
+                for i in range(start_idx, len(response_text)):
+                    if response_text[i] == '{':
+                        brace_count += 1
+                    elif response_text[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_str = response_text[start_idx:i+1]
+                            data = json.loads(json_str)
+                            break
+                else:
+                    data = json.loads(response_text)
+            else:
+                data = json.loads(response_text)
+            print(f"DEBUG: Extracted - Topic: {data.get('topic', 'unknown')}, Enriched: {data.get('enriched_query', query)}")
+            return data.get('enriched_query', query)
         except Exception as e:
             print(f"DEBUG: Extraction failed: {e}. Using original query.")
             return query  # Fallback to raw query
@@ -232,13 +289,54 @@ def search_searxng(query, num_results=5):
     print(f"DEBUG: Final unique results: {len(unique_results)}")  # Debug
     return unique_results
 
-def scrape_with_crawl4ai(urls: List[str]):
-    crawler = AsyncWebCrawler()
-    docs = []
-    for url in urls:
-        result = crawler.crawl(url=url, output_format="markdown")
-        if result and result.markdown:
-            docs.append({"text": result.markdown, "url": url})
+def scrape_with_crawl4ai(urls: List[str], timeout_per_url: int = 30):
+    """Scrape URLs with timeout protection."""
+    import asyncio
+    
+    async def scrape_url(crawler, url):
+        """Scrape a single URL with timeout."""
+        try:
+            result = await asyncio.wait_for(
+                crawler.crawl(url=url, output_format="markdown"),
+                timeout=timeout_per_url
+            )
+            return result
+        except asyncio.TimeoutError:
+            print(f"DEBUG: Scraping timeout for {url} after {timeout_per_url}s")
+            return None
+        except Exception as e:
+            print(f"DEBUG: Scraping error for {url}: {e}")
+            return None
+    
+    async def scrape_all():
+        """Scrape all URLs."""
+        async with AsyncWebCrawler() as crawler:
+            docs = []
+            for url in urls:
+                result = await scrape_url(crawler, url)
+                if result and result.markdown:
+                    # Limit document size to prevent memory issues
+                    max_chars = 50000  # Limit to ~50k chars per document
+                    text = result.markdown[:max_chars] if len(result.markdown) > max_chars else result.markdown
+                    docs.append({"text": text, "url": url})
+                    print(f"DEBUG: Scraped {url} ({len(text)} chars)")
+            return docs
+    
+    # Run async scraping with proper event loop handling
+    try:
+        # Check if we're in an async context (get_running_loop raises RuntimeError if no loop)
+        asyncio.get_running_loop()
+        # If we get here, we're in an async context - this shouldn't happen in sync code
+        print("WARNING: scrape_with_crawl4ai called from async context. Results may be incomplete.")
+        docs = []
+    except RuntimeError:
+        # No running loop, safe to use asyncio.run
+        try:
+            docs = asyncio.run(scrape_all())
+        except Exception as e:
+            print(f"DEBUG: Error in scraping: {e}")
+            docs = []
+    
     return docs
 
 # Main RAG prompt (unchanged)
@@ -255,8 +353,9 @@ def run_agent():
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     
-    # Init trust agent
+    # Init trust agent and query extractor agent
     trust_agent = TrustAgent(Settings.llm)
+    query_extractor = QueryExtractorAgent(Settings.llm)
     
     # Optional: Wrap in ReActAgent for more complex flows
     # from llama_index.core.tools import QueryEngineTool
@@ -269,9 +368,8 @@ def run_agent():
         user_query = input("Ask (or 'quit'): ")
         if user_query.lower() == 'quit':
             break
-        # NEW: Fast heuristic enrichment
-        enricher = QueryEnricher()
-        enriched_query = enricher.enrich(user_query)
+        # Use QueryExtractorAgent to extract and enrich the query
+        enriched_query = query_extractor.extract_and_enrich(user_query)
 
         # Step 1: Broad search (now with enriched query)
         search_q = build_search_query(enriched_query)  # Pass enriched
@@ -307,8 +405,12 @@ def run_agent():
         query_engine = CustomQueryEngine.from_defaults(
             retriever=retriever, node_postprocessors=[postprocessor], system_prompt=system_prompt
         )
-        response = query_engine.query(user_query)
-        print(f"Answer: {response}\nSources: {response.get_formatted_sources()}")
+        try:
+            response = query_engine.query(user_query)
+            print(f"Answer: {response}\nSources: {response.get_formatted_sources()}")
+        except Exception as e:
+            print(f"ERROR: Query processing failed: {e}")
+            print("This might be due to timeout or context size. Try a simpler query or check model performance.")
 
 if __name__ == "__main__":
     run_agent()
