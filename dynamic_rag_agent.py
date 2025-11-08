@@ -333,7 +333,7 @@ def scrape_with_crawl4ai(urls: List[str], timeout_per_url: int = 30):
         """Scrape a single URL with timeout."""
         try:
             result = await asyncio.wait_for(
-                crawler.crawl(url=url, output_format="markdown"),
+                crawler.arun(url=url),
                 timeout=timeout_per_url
             )
             return result
@@ -346,9 +346,9 @@ def scrape_with_crawl4ai(urls: List[str], timeout_per_url: int = 30):
     
     async def scrape_all():
         """Scrape all URLs."""
-        crawler = AsyncWebCrawler()
         docs = []
-        try:
+        # Use async context manager for proper initialization and cleanup
+        async with AsyncWebCrawler() as crawler:
             for url in urls:
                 result = await scrape_url(crawler, url)
                 if result and hasattr(result, 'markdown') and result.markdown:
@@ -357,13 +357,6 @@ def scrape_with_crawl4ai(urls: List[str], timeout_per_url: int = 30):
                     text = result.markdown[:max_chars] if len(result.markdown) > max_chars else result.markdown
                     docs.append({"text": text, "url": url})
                     print(f"DEBUG: Scraped {url} ({len(text)} chars)")
-        finally:
-            # Clean up crawler if needed
-            if hasattr(crawler, 'close'):
-                try:
-                    await crawler.close()
-                except Exception:
-                    pass
         return docs
     
     # Run async scraping with proper event loop handling
