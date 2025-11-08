@@ -1,33 +1,114 @@
+"""
+Dynamic RAG Agent with Trust Filtering and Query Enrichment.
+
+This module provides a RAG (Retrieval-Augmented Generation) system that:
+- Enriches user queries using LLM-based extraction
+- Filters search results through a trust scoring system
+- Scrapes and indexes trusted sources
+- Generates answers based on retrieved context
+
+Designed for AI assistant compatibility with comprehensive type hints,
+docstrings, and structured code organization.
+"""
+
 from llama_index.core import VectorStoreIndex, Settings, PromptTemplate, Document
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.storage import StorageContext
+from llama_index.core.query_engine import BaseQueryEngine
+from llama_index.core.llms.types import LLM
+from llama_index.vector_stores.chroma import ChromaVectorStore
 import chromadb
 import requests
 from crawl4ai import AsyncWebCrawler
 import whois
 import re
-from typing import List, Dict
-from llama_index.vector_stores.chroma import ChromaVectorStore
 import json
+import asyncio
+import logging
+from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse
 from datetime import datetime
 
-# Configure local components
-Settings.embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
-# Increased timeout and added max_tokens to prevent long generations
+# Configure logging for better debugging and AI assistant understanding
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configuration constants - makes code more maintainable and AI-friendly
+class Config:
+    """Application configuration constants."""
+    # LLM Configuration
+    LLM_MODEL: str = "phi3:3.8b"
+    LLM_TIMEOUT: float = 600.0  # seconds
+    LLM_TEMPERATURE: float = 0.1
+    LLM_MAX_TOKENS: int = 512
+    
+    # Embedding Configuration
+    EMBED_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    
+    # Trust Scoring Configuration
+    TRUST_THRESHOLD: float = 0.7
+    MIN_TRUSTED_SOURCES: int = 2
+    HTTPS_SCORE_BONUS: float = 0.1
+    OFFICIAL_TLD_SCORE_BONUS: float = 0.2
+    OFFICIAL_PATH_SCORE_BONUS: float = 0.2
+    VENDOR_MATCH_SCORE_BONUS: float = 0.3
+    NEUTRAL_SCORE: float = 0.5
+    
+    # Search Configuration
+    SEARXNG_URL: str = "http://localhost:8080/search"
+    SEARXNG_TIMEOUT: int = 10  # seconds
+    DEFAULT_NUM_RESULTS: int = 5
+    SEARCH_ENGINES: List[str] = ["google"]
+    
+    # Scraping Configuration
+    SCRAPE_TIMEOUT_PER_URL: int = 30  # seconds
+    MAX_DOCUMENT_CHARS: int = 50000
+    
+    # Domain Info Configuration
+    DOMAIN_CHECK_TIMEOUT: int = 5  # seconds
+    WHOIS_TIMEOUT: int = 5  # seconds
+    
+    # Vector Store Configuration
+    CHROMA_DB_PATH: str = "./temp_chroma"
+    CHROMA_COLLECTION_NAME: str = "query_docs"
+    SIMILARITY_TOP_K: int = 3
+    SIMILARITY_CUTOFF: float = 0.7
+
+# Configure local components using Config constants
+Settings.embed_model = HuggingFaceEmbedding(model_name=Config.EMBED_MODEL)
 Settings.llm = Ollama(
-    model="phi3:3.8b", 
-    request_timeout=600.0,  # Increased from 120 to 600 seconds
-    temperature=0.1,  # Lower temperature for faster, more deterministic responses
-    max_tokens=512  # Limit response length to prevent very long generations
+    model=Config.LLM_MODEL,
+    request_timeout=Config.LLM_TIMEOUT,
+    temperature=Config.LLM_TEMPERATURE,
+    max_tokens=Config.LLM_MAX_TOKENS
 )
 
-# Trust Agent: Dynamic evaluator
 class TrustAgent:
-    def __init__(self, llm):
+    """
+    Evaluates URL trustworthiness using heuristic rules and LLM-based scoring.
+    
+    Uses a two-stage approach:
+    1. Fast heuristic scoring (rule-based, no LLM)
+    2. LLM-based scoring for ambiguous cases
+    
+    Attributes:
+        llm: The language model instance for LLM-based scoring
+        trust_prompt: Template for LLM-based trust evaluation
+    """
+    
+    def __init__(self, llm: LLM) -> None:
+        """
+        Initialize TrustAgent with an LLM instance.
+        
+        Args:
+            llm: Language model for scoring URLs that don't pass heuristic checks
+        """
         self.llm = llm
         self.trust_prompt = PromptTemplate(
             "Score this URL for trustworthiness as an official source (0-1, >0.7=trusted). "
@@ -37,7 +118,16 @@ class TrustAgent:
         )
     
     def get_domain_info(self, url: str) -> str:
-        """Quick whois/metadata check (with timeout)."""
+        """
+        Retrieve domain information including age, registrar, and HTTPS status.
+        
+        Args:
+            url: The URL to check domain information for
+            
+        Returns:
+            A formatted string containing domain age, registrar, and HTTPS status.
+            Returns "Unknown domain info" if the check fails.
+        """
         try:
             domain = re.sub(r"https?://(www\.)?", "", url).split('/')[0]
             w = whois.whois(domain)
@@ -54,103 +144,187 @@ class TrustAgent:
             
             # Check HTTPS with timeout
             try:
-                https_check = requests.head(url, timeout=5, allow_redirects=True)
+                https_check = requests.head(
+                    url, 
+                    timeout=Config.DOMAIN_CHECK_TIMEOUT, 
+                    allow_redirects=True
+                )
                 hsts = https_check.headers.get('Strict-Transport-Security', 'No')
-            except Exception:
+            except (requests.RequestException, requests.Timeout) as e:
+                logger.debug(f"HTTPS check failed for {url}: {e}")
                 hsts = "Unknown"
             
             return f"Age: {age}yrs, Registrar: {registrar}, HTTPS: {hsts}"
         except Exception as e:
-            print(f"DEBUG: Domain info error for {url}: {e}")
+            logger.error(f"Domain info error for {url}: {e}")
             return "Unknown domain info"
     
-    def heuristic_score(self, url: str, query: str) -> Dict:
-        """Fast rule-based scoring (no LLM)."""
-        parsed = urlparse(url)
-        score = 0.5  # Neutral start
-        reason = []
+    def heuristic_score(self, url: str, query: str) -> Dict[str, Any]:
+        """
+        Fast rule-based URL trust scoring without LLM.
         
-        # HTTPS
+        Scoring criteria:
+        - HTTPS: +0.1
+        - Official TLD (.gov, .edu, .org, .io): +0.2
+        - Official paths (docs, guide, official): +0.2
+        - Vendor match: +0.3
+        
+        Args:
+            url: The URL to score
+            query: The user query for vendor matching
+            
+        Returns:
+            Dictionary with 'score' (float 0-1), 'reason' (str), and 'method' ('heuristic')
+        """
+        parsed = urlparse(url)
+        score = Config.NEUTRAL_SCORE
+        reason: List[str] = []
+        
+        # HTTPS check
         if parsed.scheme == 'https':
-            score += 0.1
+            score += Config.HTTPS_SCORE_BONUS
             reason.append("HTTPS")
         
         # Official TLDs
-        official_tlds = ['.gov', '.edu', '.org', '.io']  # Add more as needed
+        official_tlds = ['.gov', '.edu', '.org', '.io']
         if any(tld in parsed.netloc.lower() for tld in official_tlds):
-            score += 0.2
+            score += Config.OFFICIAL_TLD_SCORE_BONUS
             reason.append("Official TLD")
         
         # Docs/official paths
-        if 'docs' in parsed.path.lower() or 'guide' in parsed.path.lower() or 'official' in parsed.path.lower():
-            score += 0.2
+        official_paths = ['docs', 'guide', 'official']
+        if any(path in parsed.path.lower() for path in official_paths):
+            score += Config.OFFICIAL_PATH_SCORE_BONUS
             reason.append("Official path")
         
-        # Vendor match from query (simple keyword)
+        # Vendor match from query (extensible pattern)
         query_lower = query.lower()
-        if 'quarkus' in query_lower and 'quarkus.io' in url.lower():
-            score += 0.3
-            reason.append("Query-vendor match")
-        # Extend for other topics: elif 'aws' in query_lower and 'aws.amazon.com' in url.lower(): score += 0.3
+        vendor_matches = [
+            ('quarkus', 'quarkus.io'),
+            ('aws', 'aws.amazon.com'),
+            ('kubernetes', 'kubernetes.io'),
+        ]
+        for keyword, domain in vendor_matches:
+            if keyword in query_lower and domain in url.lower():
+                score += Config.VENDOR_MATCH_SCORE_BONUS
+                reason.append("Query-vendor match")
+                break
         
-        return {'score': min(score, 1.0), 'reason': '; '.join(reason), 'method': 'heuristic'}
+        return {
+            'score': min(score, 1.0),
+            'reason': '; '.join(reason),
+            'method': 'heuristic'
+        }
     
-    def score_url(self, url: str, query: str) -> Dict:
-        # Try heuristic first (fast)
+    def score_url(self, url: str, query: str) -> Dict[str, Any]:
+        """
+        Score URL trustworthiness using heuristic first, then LLM if needed.
+        
+        Args:
+            url: The URL to score
+            query: The user query for context
+            
+        Returns:
+            Dictionary with 'score', 'reason', and 'method' keys
+        """
+        # Try heuristic first (fast, no LLM cost)
         heur = self.heuristic_score(url, query)
-        if heur['score'] >= 0.7:
-            print(f"DEBUG: Heuristic trusted {url} (score: {heur['score']})")
+        if heur['score'] >= Config.TRUST_THRESHOLD:
+            logger.debug(f"Heuristic trusted {url} (score: {heur['score']})")
             return heur
         
         # Fallback to LLM if needed (slower, but with timeout safety)
-        print(f"DEBUG: Using LLM for {url}")
+        logger.debug(f"Using LLM for {url}")
         domain_info = self.get_domain_info(url)
         try:
-            # Use a shorter, more focused prompt to reduce generation time
             short_prompt = PromptTemplate(
                 "Score URL trust (0-1, >0.7=trusted). Query: {query}. URL: {url}. "
                 "Output JSON only: {{'score': float, 'reason': str}}"
             )
             response = self.llm.complete(short_prompt.format(query=query, url=url))
-            # Try to extract JSON from response (handle cases where model adds extra text)
             response_text = response.text.strip()
-            # Find JSON object by finding first { and matching closing }
-            start_idx = response_text.find('{')
-            if start_idx != -1:
-                brace_count = 0
-                for i in range(start_idx, len(response_text)):
-                    if response_text[i] == '{':
-                        brace_count += 1
-                    elif response_text[i] == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            json_str = response_text[start_idx:i+1]
-                            return json.loads(json_str)
-            # Try parsing the whole response
+            
+            # Extract JSON from response (handle cases where model adds extra text)
+            json_data = self._extract_json_from_text(response_text)
+            if json_data:
+                return json_data
             return json.loads(response_text)
-        except Exception as e:
-            print(f"DEBUG: LLM timeout/error for {url}: {e}. Falling back to heuristic.")
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"LLM timeout/error for {url}: {e}. Falling back to heuristic.")
             return self.heuristic_score(url, query)  # Graceful fallback
     
-    def filter_trusted(self, urls: List[str], query: str, min_trusted: int = 2) -> List[str]:
-        # Process URLs with timeout protection per URL
-        scores = []
+    @staticmethod
+    def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract JSON object from text that may contain extra content.
+        
+        Args:
+            text: Text that may contain a JSON object
+            
+        Returns:
+            Parsed JSON dictionary or None if extraction fails
+        """
+        start_idx = text.find('{')
+        if start_idx == -1:
+            return None
+        
+        brace_count = 0
+        for i in range(start_idx, len(text)):
+            if text[i] == '{':
+                brace_count += 1
+            elif text[i] == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    json_str = text[start_idx:i+1]
+                    try:
+                        return json.loads(json_str)
+                    except json.JSONDecodeError:
+                        return None
+        return None
+    
+    def filter_trusted(
+        self, 
+        urls: List[str], 
+        query: str, 
+        min_trusted: int = Config.MIN_TRUSTED_SOURCES
+    ) -> List[str]:
+        """
+        Filter URLs based on trust scores.
+        
+        Args:
+            urls: List of URLs to filter
+            query: User query for context
+            min_trusted: Minimum number of trusted sources required
+            
+        Returns:
+            List of trusted URLs, or empty list if insufficient trusted sources
+        """
+        scores: List[Tuple[str, Dict[str, Any]]] = []
         for url in urls:
             try:
                 score_data = self.score_url(url, query)
                 scores.append((url, score_data))
             except Exception as e:
-                print(f"DEBUG: Error scoring {url}: {e}. Skipping.")
+                logger.error(f"Error scoring {url}: {e}. Skipping.")
                 continue
         
-        trusted = [url for url, data in scores if data['score'] > 0.7]
+        trusted = [
+            url for url, data in scores 
+            if data['score'] > Config.TRUST_THRESHOLD
+        ]
+        
         if len(trusted) < min_trusted:
-            print(f"Trust Agent: Only {len(trusted)} trusted sources; need more.")
+            logger.warning(
+                f"Trust Agent: Only {len(trusted)} trusted sources; need {min_trusted}."
+            )
             return []
-        print(f"Trust Agent: Filtered to {len(trusted)} trusted URLs.")
+        
+        logger.info(f"Trust Agent: Filtered to {len(trusted)} trusted URLs.")
         for url, data in scores:
-            if data['score'] <= 0.7:
-                print(f"Rejected {url}: {data['reason']} (score: {data['score']})")
+            if data['score'] <= Config.TRUST_THRESHOLD:
+                logger.debug(
+                    f"Rejected {url}: {data['reason']} (score: {data['score']})"
+                )
         return trusted
 
 class QueryExtractorAgent:
@@ -450,11 +624,11 @@ def run_agent():
         index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
 
         # Step 5: Retrieve and query
-        retriever = VectorIndexRetriever(index=index, similarity_top_k=3)
-        postprocessor = SimilarityPostprocessor(similarity_cutoff=0.7)
-        # Use index.as_query_engine for simpler API with system prompt support
+        postprocessor = SimilarityPostprocessor(similarity_cutoff=Config.SIMILARITY_CUTOFF)
+        # Use index.as_query_engine - it creates its own retriever internally
+        # Pass similarity_top_k instead of retriever to avoid conflict
         query_engine = index.as_query_engine(
-            retriever=retriever,
+            similarity_top_k=Config.SIMILARITY_TOP_K,
             node_postprocessors=[postprocessor],
             system_prompt=system_prompt
         )
