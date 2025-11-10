@@ -1,32 +1,62 @@
 #!/usr/bin/env python3
-"""Quick diagnostic script to check GPU availability and Ollama configuration."""
+"""Quick diagnostic script to check GPU availability and Ollama configuration for macOS."""
 
 import subprocess
 import os
 import sys
+import platform
 
-def check_nvidia_gpu():
-    """Check if NVIDIA GPU is available."""
+def check_apple_silicon():
+    """Check if running on Apple Silicon (M1/M2/M3)."""
     try:
-        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
+        # Check architecture
+        arch = platform.machine()
+        if arch == 'arm64':
+            # Get CPU brand to confirm Apple Silicon
+            result = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                cpu_brand = result.stdout.strip()
+                print(f"✓ Apple Silicon detected: {cpu_brand}")
+                print(f"  Architecture: {arch}")
+                return True
+        else:
+            print(f"  Architecture: {arch} (Intel Mac)")
+        return False
+    except Exception as e:
+        print(f"✗ Error checking CPU: {e}")
+        return False
+
+def check_gpu_info():
+    """Check GPU information using system_profiler."""
+    try:
+        result = subprocess.run(['system_profiler', 'SPDisplaysDataType'], 
+                              capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            print("✓ NVIDIA GPU detected:")
-            print(result.stdout)
+            print("\n✓ GPU Information:")
+            # Extract key GPU info
+            lines = result.stdout.split('\n')
+            gpu_lines = [line for line in lines if 'Chipset Model' in line or 'Metal' in line or 'VRAM' in line]
+            if gpu_lines:
+                for line in gpu_lines[:5]:  # Show first 5 relevant lines
+                    print(f"  {line.strip()}")
+            else:
+                print("  " + result.stdout[:200])  # Show first 200 chars if no specific matches
             return True
         else:
-            print("✗ nvidia-smi failed")
+            print("✗ Could not retrieve GPU information")
             return False
     except FileNotFoundError:
-        print("✗ nvidia-smi not found - NVIDIA drivers may not be installed")
+        print("✗ system_profiler not found")
         return False
     except Exception as e:
         print(f"✗ Error checking GPU: {e}")
         return False
 
 def check_ollama_env():
-    """Check Ollama environment variables."""
+    """Check Ollama environment variables for macOS."""
     print("\nOllama Environment Variables:")
-    gpu_vars = ['OLLAMA_GPU_LAYERS', 'OLLAMA_NUM_GPU', 'CUDA_VISIBLE_DEVICES']
+    gpu_vars = ['OLLAMA_NUM_GPU', 'OLLAMA_GPU_LAYERS', 'OLLAMA_FLASH_ATTENTION']
     found = False
     for var in gpu_vars:
         value = os.environ.get(var)
@@ -35,6 +65,7 @@ def check_ollama_env():
             found = True
     if not found:
         print("  No GPU-related environment variables set")
+        print("  Note: On Apple Silicon, Ollama uses Metal automatically (no config needed)")
     return found
 
 def check_ollama_info():
@@ -56,10 +87,11 @@ def check_ollama_info():
 
 def main():
     print("=" * 60)
-    print("Ollama GPU Diagnostic Check")
+    print("Ollama GPU Diagnostic Check (macOS)")
     print("=" * 60)
     
-    has_gpu = check_nvidia_gpu()
+    is_apple_silicon = check_apple_silicon()
+    has_gpu_info = check_gpu_info()
     has_env = check_ollama_env()
     ollama_running = check_ollama_info()
     
@@ -67,22 +99,26 @@ def main():
     print("Recommendations:")
     print("=" * 60)
     
-    if not has_gpu:
-        print("1. Install NVIDIA GPU drivers if you have an NVIDIA GPU")
-        print("2. For AMD/Intel GPUs, check Ollama documentation for ROCm/oneAPI support")
+    if is_apple_silicon:
+        print("✓ Apple Silicon detected - Ollama will use Metal GPU acceleration automatically")
+        print("\n1. No additional configuration needed for GPU acceleration")
+        print("2. Ollama uses Metal framework for GPU acceleration on Apple Silicon")
+        print("3. For better performance, ensure you have enough unified memory (RAM)")
     else:
-        if not has_env:
-            print("1. Set OLLAMA_GPU_LAYERS environment variable:")
-            print("   Windows PowerShell: $env:OLLAMA_GPU_LAYERS='35'")
-            print("   Windows CMD: set OLLAMA_GPU_LAYERS=35")
-            print("   Linux/Mac: export OLLAMA_GPU_LAYERS=35")
-            print("\n2. Restart Ollama after setting environment variables")
-            print("3. For phi3:3.8b, try OLLAMA_GPU_LAYERS=35 (or higher if you have more VRAM)")
+        print("ℹ Intel Mac detected")
+        print("\n1. Ollama will use CPU or Metal (if supported by your GPU)")
+        print("2. Check if your Mac supports Metal: https://support.apple.com/en-us/HT202823")
+    
+    if not has_env and is_apple_silicon:
+        print("\n4. Optional: Set OLLAMA_NUM_GPU to control GPU usage:")
+        print("   export OLLAMA_NUM_GPU=1")
+        print("   (Usually not needed - Ollama detects GPU automatically)")
     
     if ollama_running:
-        print("\n4. Check current GPU usage: ollama ps")
-        print("5. Try pulling the model again: ollama pull phi3:3.8b")
-        print("6. Monitor GPU usage during inference: nvidia-smi -l 1")
+        print("\n5. Check current model usage: ollama ps")
+        print("6. Try pulling the model: ollama pull phi3:3.8b")
+        print("7. Monitor system performance: Activity Monitor → Window → GPU History")
+        print("8. Test inference speed: ollama run phi3:3.8b")
 
 if __name__ == "__main__":
     main()
