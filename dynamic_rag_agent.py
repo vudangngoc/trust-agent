@@ -7,13 +7,12 @@ This module provides a RAG (Retrieval-Augmented Generation) system that:
 - Scrapes and indexes trusted sources
 - Generates answers based on retrieved context
 
-Designed for AI assistant compatibility with comprehensive type hints,
-docstrings, and structured code organization.
+Migrated to use Abacus AI RouteLLM instead of Ollama.
 """
 
 from llama_index.core import VectorStoreIndex, Settings, PromptTemplate, Document
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.llms.ollama import Ollama
+from llama_index.llms.openai import OpenAI  # RouteLLM uses OpenAI-compatible API
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.storage import StorageContext
@@ -30,6 +29,7 @@ import logging
 from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse
 from datetime import datetime
+import os
 
 # Configure logging for better debugging and AI assistant understanding
 logging.basicConfig(
@@ -41,8 +41,10 @@ logger = logging.getLogger(__name__)
 # Configuration constants - makes code more maintainable and AI-friendly
 class Config:
     """Application configuration constants."""
-    # LLM Configuration
-    LLM_MODEL: str = "phi3:3.8b"
+    # Abacus AI RouteLLM Configuration
+    ABACUS_API_KEY: str = os.getenv("ABACUS_API_KEY", "")  # Set your API key here or via environment variable
+    ABACUS_BASE_URL: str = "https://routellm.abacus.ai/v1/"  # RouteLLM endpoint
+    LLM_MODEL: str = "gpt-5-mini"  # You can use: gpt-4o, gpt-4o-mini, claude-3-5-sonnet, etc.
     LLM_TIMEOUT: float = 600.0  # seconds
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_TOKENS: int = 512
@@ -62,7 +64,7 @@ class Config:
     # Search Configuration
     SEARXNG_URL: str = "http://localhost:8080/search"
     SEARXNG_TIMEOUT: int = 10  # seconds
-    DEFAULT_NUM_RESULTS: int = 5
+    DEFAULT_NUM_RESULTS: int = 10
     SEARCH_ENGINES: List[str] = ["google"]
     
     # Scraping Configuration
@@ -76,16 +78,20 @@ class Config:
     # Vector Store Configuration
     CHROMA_DB_PATH: str = "./temp_chroma"
     CHROMA_COLLECTION_NAME: str = "query_docs"
-    SIMILARITY_TOP_K: int = 3
-    SIMILARITY_CUTOFF: float = 0.7
+    SIMILARITY_TOP_K: int = 5  # Increased from 3 to get more retrieval candidates
+    SIMILARITY_CUTOFF: float = 0.4  # Lowered from 0.5 to allow nodes with scores >= 0.4
 
 # Configure local components using Config constants
 Settings.embed_model = HuggingFaceEmbedding(model_name=Config.EMBED_MODEL)
-Settings.llm = Ollama(
+
+# Configure Abacus AI RouteLLM
+Settings.llm = OpenAI(
     model=Config.LLM_MODEL,
-    request_timeout=Config.LLM_TIMEOUT,
+    api_key=Config.ABACUS_API_KEY,
+    api_base=Config.ABACUS_BASE_URL,
     temperature=Config.LLM_TEMPERATURE,
-    max_tokens=Config.LLM_MAX_TOKENS
+    max_tokens=Config.LLM_MAX_TOKENS,
+    timeout=Config.LLM_TIMEOUT
 )
 
 class TrustAgent:
@@ -97,7 +103,7 @@ class TrustAgent:
     2. LLM-based scoring for ambiguous cases
     
     Attributes:
-        llm: The language model instance for LLM-based scoring
+        llm: The language model instance for LLM-based trust evaluation
         trust_prompt: Template for LLM-based trust evaluation
     """
     
@@ -122,7 +128,7 @@ class TrustAgent:
         
         Args:
             url: The URL to check domain information for
-            
+        
         Returns:
             A formatted string containing domain age, registrar, and HTTPS status.
             Returns "Unknown domain info" if the check fails.
@@ -171,7 +177,7 @@ class TrustAgent:
         Args:
             url: The URL to score
             query: The user query for vendor matching
-            
+        
         Returns:
             Dictionary with 'score' (float 0-1), 'reason' (str), and 'method' ('heuristic')
         """
@@ -222,7 +228,7 @@ class TrustAgent:
         Args:
             url: The URL to score
             query: The user query for context
-            
+        
         Returns:
             Dictionary with 'score', 'reason', and 'method' keys
         """
@@ -240,7 +246,9 @@ class TrustAgent:
                 "Score URL trust (0-1, >0.7=trusted). Query: {query}. URL: {url}. "
                 "Output JSON only: {{'score': float, 'reason': str}}"
             )
+            print(f"DEBUG: Calling OpenAI LLM for URL scoring: {url}")
             response = self.llm.complete(short_prompt.format(query=query, url=url))
+            print(f"DEBUG: OpenAI LLM response for {url}: {response.text}")
             response_text = response.text.strip()
             
             # Extract JSON from response (handle cases where model adds extra text)
@@ -259,7 +267,7 @@ class TrustAgent:
         
         Args:
             text: Text that may contain a JSON object
-            
+        
         Returns:
             Parsed JSON dictionary or None if extraction fails
         """
@@ -294,7 +302,7 @@ class TrustAgent:
             urls: List of URLs to filter
             query: User query for context
             min_trusted: Minimum number of trusted sources required
-            
+        
         Returns:
             List of trusted URLs, or empty list if insufficient trusted sources
         """
@@ -357,16 +365,28 @@ class QueryExtractorAgent:
         try:
             # Enhanced prompt that preserves topic names and adds search enhancements
             short_prompt = PromptTemplate(
-                "Extract the main topic/entity name from the query and create an enriched search query. "
-                "CRITICAL: The enriched_query MUST start with and include the exact topic/entity name from the original query. "
-                "Do NOT replace the topic name with a description or explanation. "
-                "For example, if query is 'Quarkus', enriched_query should be 'Quarkus' (with optional enhancements like 'site:quarkus.io' or 'official docs'). "
-                "If query is 'What is Quarkus?', enriched_query should be 'Quarkus' or '\"Quarkus\" official docs', NOT 'lightweight Java framework'. "
-                "Add search enhancements: site: operators for known projects (e.g., site:quarkus.io for Quarkus), quotes for exact phrases, 'official docs' for reliability. "
-                "Query: {query}. "
-                "Output JSON: {{'topic': str, 'enriched_query': str}}"
+                "You are a search query optimizer. Your task is to transform user queries into effective search engine queries.\n\n"
+                "RULES:\n"
+                "1. PRESERVE all key entities, product names, and technical terms exactly as written (e.g., 'JavaCV', 'GraalVM', 'Quarkus')\n"
+                "2. EXTRACT the core question or intent (e.g., 'compatibility', 'tutorial', 'comparison', 'error fix')\n"
+                "3. ADD relevant technical keywords that would appear in official documentation\n"
+                "4. USE quotes for exact phrase matching when appropriate (e.g., \"error message\" or \"specific feature\")\n"
+                "5. ADD context terms like 'official documentation', 'guide', 'reference' for authoritative sources\n"
+                "6. REMOVE filler words (e.g., 'Can I', 'How do I', 'What is', 'Tell me about')\n"
+                "7. DO NOT add site: operators\n"
+                "8. DO NOT replace technical terms with generic descriptions\n\n"
+                "EXAMPLES:\n"
+                "- Input: 'Can I use JavaCV on GraalVM?' → Output: 'JavaCV GraalVM compatibility official documentation'\n"
+                "- Input: 'What is Quarkus?' → Output: 'Quarkus framework official guide introduction'\n"
+                "- Input: 'How to deploy Spring Boot to AWS?' → Output: 'Spring Boot AWS deployment guide official documentation'\n"
+                "- Input: 'Kubernetes networking tutorial' → Output: 'Kubernetes networking tutorial official documentation'\n\n"
+                "User Query: {query}\n\n"
+                "Output ONLY valid JSON with double quotes, no markdown, no code blocks:\n"
+                "{\"topic\": \"main entity or technology\", \"enriched_query\": \"optimized search query\"}"
             )
+            print(f"DEBUG: Calling OpenAI LLM for query enrichment: {query}")
             response = self.llm.complete(short_prompt.format(query=query))
+            print(f"DEBUG: OpenAI LLM response for query enrichment: {response.text}")
             response_text = response.text.strip()
             # Find JSON object by finding first { and matching closing }
             start_idx = response_text.find('{')
@@ -581,7 +601,7 @@ def run_agent():
     
     # Optional: Wrap in ReActAgent for more complex flows
     # from llama_index.core.tools import QueryEngineTool
-    # web_tool = FunctionTool.from_defaults(fn=lambda q: search_searxng(q), name="web_search")
+    # web_tool = FunctionTool.from_defaults(fn=lambda q: search_searxng(q), name="Web Search")
     # trust_tool = FunctionTool.from_defaults(fn=lambda u, q: trust_agent.filter_trusted([u], q), name="trust_filter")
     # agent = ReActAgent.from_tools([web_tool, trust_tool], llm=Settings.llm, verbose=True)
     # But for simplicity, inline below
@@ -613,6 +633,9 @@ def run_agent():
 
         # Step 3: Scrape trusted only
         scraped_docs = scrape_with_crawl4ai(trusted_urls)
+        print(f"DEBUG: Number of scraped docs: {len(scraped_docs)}")
+        for i, doc in enumerate(scraped_docs):
+            print(f"DEBUG: Doc {i}: URL={doc.get('url', 'unknown')}, Text length={len(doc.get('text', ''))}")
         if not scraped_docs:
             print("Scraping failed.")
             continue
@@ -629,27 +652,49 @@ def run_agent():
                 print(f"DEBUG: Error creating document for {doc.get('url', 'unknown')}: {e}")
                 continue
         
+        print(f"DEBUG: Number of documents created: {len(documents)}")
         if not documents:
             print("No valid documents created from scraped content.")
             continue
         
         index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
 
-        # Step 5: Retrieve and query
+        # Debug retrieval before querying
+        retriever = index.as_retriever(similarity_top_k=Config.SIMILARITY_TOP_K)
+        nodes = retriever.retrieve(user_query)
+        print(f"DEBUG: Retrieved {len(nodes)} nodes before postprocessing")
+        for i, node in enumerate(nodes):
+            print(f"DEBUG: Node {i} score: {node.score:.3f}, URL: {node.metadata.get('url', 'unknown')}, text preview: {node.text[:200]}...")
+        
         postprocessor = SimilarityPostprocessor(similarity_cutoff=Config.SIMILARITY_CUTOFF)
+        from llama_index.core.schema import QueryBundle
+        query_bundle = QueryBundle(query_str=user_query)
+        filtered_nodes = postprocessor.postprocess_nodes(nodes, query_bundle=query_bundle)
+        print(f"DEBUG: After postprocessing with cutoff {Config.SIMILARITY_CUTOFF}, {len(filtered_nodes)} nodes remain")
+
+        # Step 5: Retrieve and query
         # Use index.as_query_engine - it creates its own retriever internally
         # Pass similarity_top_k instead of retriever to avoid conflict
         query_engine = index.as_query_engine(
             similarity_top_k=Config.SIMILARITY_TOP_K,
             node_postprocessors=[postprocessor],
-            system_prompt=system_prompt
+            system_prompt=system_prompt,
+            verbose=True  # Enable verbose logging for debugging retrieval and LLM calls
         )
         try:
             response = query_engine.query(user_query)
+            print(f"DEBUG: Query response object: {response}")
+            print(f"DEBUG: Response text: '{response.response}'")
             print(f"Answer: {response}\nSources: {response.get_formatted_sources()}")
         except Exception as e:
             print(f"ERROR: Query processing failed: {e}")
             print("This might be due to timeout or context size. Try a simpler query or check model performance.")
 
 if __name__ == "__main__":
+    # Check if API key is set
+    if not Config.ABACUS_API_KEY:
+        print("ERROR: ABACUS_API_KEY not set. Please set it as an environment variable or in the Config class.")
+        print("You can get your API key from: https://abacus.ai/app/route-llm-apis")
+        exit(1)
+    
     run_agent()
