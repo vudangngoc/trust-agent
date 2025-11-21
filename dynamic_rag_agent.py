@@ -11,13 +11,42 @@ Migrated to use Abacus AI RouteLLM instead of Ollama.
 """
 
 from llama_index.core import VectorStoreIndex, Settings, PromptTemplate, Document
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+# Embedding backend: prefer llama_index's HuggingFace wrapper when available.
+_hf_err = None
+try:
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+except Exception as _hf_err:
+    try:
+        # Some versions expose a different import path
+        from llama_index.embeddings import HuggingFaceEmbedding  # type: ignore
+    except Exception as _inner_err:
+        # Store the original error for the error message
+        _original_hf_err = _hf_err
+        # Provide a helpful error when the class is instantiated so the user
+        # sees actionable guidance during container startup rather than an
+        # import-time traceback.
+        class HuggingFaceEmbedding:  # type: ignore
+            def __init__(self, *args, **kwargs):
+                err_msg = str(_original_hf_err) if _original_hf_err else str(_inner_err)
+                raise ImportError(
+                    "HuggingFaceEmbedding is not available in this environment. "
+                    "Install 'llama-index-embeddings-huggingface' and 'sentence-transformers' packages. "
+                    f"Original import error: {err_msg}"
+                )
 from llama_index.llms.openai import OpenAI  # RouteLLM uses OpenAI-compatible API
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.storage import StorageContext
 from llama_index.core.query_engine import BaseQueryEngine
-from llama_index.vector_stores.chroma import ChromaVectorStore
+try:
+    from llama_index.vector_stores.chroma import ChromaVectorStore
+except Exception as _err:
+    raise ImportError(
+        "llama_index.vector_stores.chroma not available. "
+        "Please ensure 'llama-index' is installed with Chroma support and rebuild the image. "
+        "Example: pip install 'llama-index[chromadb]' or add an appropriate 'llama-index' release to requirements.txt. "
+        f"Original error: {_err}"
+    )
 import chromadb
 import requests
 from crawl4ai import AsyncWebCrawler
@@ -43,7 +72,7 @@ class Config:
     """Application configuration constants."""
     # Abacus AI RouteLLM Configuration
     ABACUS_API_KEY: str = os.getenv("ABACUS_API_KEY", "")  # Set your API key here or via environment variable
-    ABACUS_BASE_URL: str = "https://routellm.abacus.ai/v1/"  # RouteLLM endpoint
+    ABACUS_BASE_URL: str = os.getenv("ABACUS_BASE_URL", "https://routellm.abacus.ai/v1/")  # OpenAI compatible API base URL
     LLM_MODEL: str = "gpt-5-mini"  # You can use: gpt-4o, gpt-4o-mini, claude-3-5-sonnet, etc.
     LLM_TIMEOUT: float = 600.0  # seconds
     LLM_TEMPERATURE: float = 0.1
@@ -62,10 +91,12 @@ class Config:
     NEUTRAL_SCORE: float = 0.5
     
     # Search Configuration
-    SEARXNG_URL: str = "http://localhost:8080/search"
+    # When running under docker-compose the searxng service is reachable at the service name `searxng`
+    SEARXNG_URL: str = "http://searxng:8080/search"
     SEARXNG_TIMEOUT: int = 10  # seconds
     DEFAULT_NUM_RESULTS: int = 10
-    SEARCH_ENGINES: List[str] = ["google"]
+    # Try multiple engines in order, use first that returns results
+    SEARCH_ENGINES: List[str] = ["duckduckgo", "google", "bing", "startpage"]
     
     # Scraping Configuration
     SCRAPE_TIMEOUT_PER_URL: int = 30  # seconds
@@ -351,38 +382,56 @@ class QueryExtractorAgent:
         """
         self.llm = llm
         self.extract_prompt = PromptTemplate(
-            "Analyze this user query and extract: "
-            "1. Main topic/entity (e.g., 'Quarkus'). "
-            "2. Intent (e.g., 'details', 'overview', 'tutorial'). "
-            "3. Refinements (e.g., 'architecture', 'comparison'). "
-            "Output JSON: {{'topic': str, 'intent': str, 'refinements': list[str], 'enriched_query': str}}. "
-            "Enrich the query for precise search: Add quotes for phrases, 'official docs' for reliability, site: operators if topic is a known project (e.g., site:quarkus.io). "
-            "Keep concise. Query: {query}"
+            "You are a search query understanding assistant.\n\n"
+            "Task:\n"
+            "Given the user query below, extract and infer:\n"
+            "1. topic: The main topic/entity (e.g., 'Quarkus').\n"
+            "2. intent: The primary intent/purpose (e.g., 'details', 'overview', 'tutorial', 'installation', 'comparison').\n"
+            "3. refinements: A list of additional qualifiers or subtopics (e.g., 'architecture', 'performance comparison with Spring Boot').\n"
+            "4. enriched_query: A concise, improved version of the query optimized for web search.\n\n"
+            "Enriched query rules:\n"
+            "- Keep it short and precise.\n"
+            "- Add double quotes around multi‑word key phrases that should stay together.\n"
+            "- Prefer reliable sources (e.g., append terms like 'official documentation', 'reference guide' when appropriate).\n"
+            "- If the topic looks like a known framework/library/project with an official site (e.g., Quarkus → quarkus.io), you MAY add a suitable site: operator.\n"
+            "- Do not invent a site: operator if you are not reasonably confident.\n"
+            "- Do not change the original meaning or add unsupported claims.\n\n"
+            "Output format (MUST be valid JSON, no comments, no trailing commas):\n"
+            "{\n"
+            "  \"topic\": string,\n"
+            "  \"intent\": string,\n"
+            "  \"refinements\": [string, ...],\n"
+            "  \"enriched_query\": string\n"
+            "}\n\n"
+            "User query: \"{query}\"\n"
         )
     
-    def extract_and_enrich(self, query: str) -> str:
-        """Extract context and return enriched search query."""
+    def extract_and_enrich(self, query: str) -> List[str]:
+        """Extract context and return multiple focused search queries.
+        
+        Returns a list of 3-5 focused queries instead of one long query to improve search results.
+        """
         try:
-            # Enhanced prompt that preserves topic names and adds search enhancements
+            # Enhanced prompt that generates multiple focused queries
             short_prompt = PromptTemplate(
-                "You are a search query optimizer. Your task is to transform user queries into effective search engine queries.\n\n"
+                "You are a search query optimizer. Your task is to transform user queries into multiple focused search engine queries.\n\n"
                 "RULES:\n"
-                "1. PRESERVE all key entities, product names, and technical terms exactly as written (e.g., 'JavaCV', 'GraalVM', 'Quarkus')\n"
-                "2. EXTRACT the core question or intent (e.g., 'compatibility', 'tutorial', 'comparison', 'error fix')\n"
-                "3. ADD relevant technical keywords that would appear in official documentation\n"
-                "4. USE quotes for exact phrase matching when appropriate (e.g., \"error message\" or \"specific feature\")\n"
-                "5. ADD context terms like 'official documentation', 'guide', 'reference' for authoritative sources\n"
+                "1. PRESERVE all key entities, product names, and technical terms exactly as written\n"
+                "2. GENERATE 3-5 separate, focused queries (not one long query)\n"
+                "3. Each query should be concise (5-10 words max) and focus on a specific aspect\n"
+                "4. Vary the queries to cover different angles: methods, algorithms, libraries, tutorials, documentation\n"
+                "5. USE quotes for exact phrase matching when appropriate\n"
                 "6. REMOVE filler words (e.g., 'Can I', 'How do I', 'What is', 'Tell me about')\n"
                 "7. DO NOT add site: operators\n"
-                "8. DO NOT replace technical terms with generic descriptions\n\n"
+                "8. DO NOT create overly long queries with many keywords\n\n"
                 "EXAMPLES:\n"
-                "- Input: 'Can I use JavaCV on GraalVM?' → Output: 'JavaCV GraalVM compatibility official documentation'\n"
-                "- Input: 'What is Quarkus?' → Output: 'Quarkus framework official guide introduction'\n"
-                "- Input: 'How to deploy Spring Boot to AWS?' → Output: 'Spring Boot AWS deployment guide official documentation'\n"
-                "- Input: 'Kubernetes networking tutorial' → Output: 'Kubernetes networking tutorial official documentation'\n\n"
+                "- Input: 'What are methods to detect QR code 2D?'\n"
+                "  Output: {{\"topic\": \"QR code detection\", \"queries\": [\"QR code detection methods\", \"2D barcode detection algorithms\", \"QR code OpenCV ZXing\", \"QR code detection tutorial\"]}}\n"
+                "- Input: 'How to deploy Spring Boot to AWS?'\n"
+                "  Output: {{\"topic\": \"Spring Boot AWS\", \"queries\": [\"Spring Boot AWS deployment\", \"Spring Boot deploy EC2\", \"Spring Boot AWS tutorial\"]}}\n\n"
                 "User Query: {query}\n\n"
                 "Output ONLY valid JSON with double quotes, no markdown, no code blocks:\n"
-                "{\"topic\": \"main entity or technology\", \"enriched_query\": \"optimized search query\"}"
+                "{{\"topic\": \"main entity or technology\", \"queries\": [\"query1\", \"query2\", \"query3\"]}}"
             )
             print(f"DEBUG: Calling OpenAI LLM for query enrichment: {query}")
             response = self.llm.complete(short_prompt.format(query=query))
@@ -405,20 +454,30 @@ class QueryExtractorAgent:
                     data = json.loads(response_text)
             else:
                 data = json.loads(response_text)
-            enriched = data.get('enriched_query', query)
+            
+            queries = data.get('queries', [])
             topic = data.get('topic', '').lower()
             
-            # Validation: Ensure topic name is present in enriched query
-            # If topic is extracted but not in enriched query, prepend it
-            if topic and topic not in enriched.lower():
-                print(f"DEBUG: Topic '{topic}' not found in enriched query, prepending it")
-                enriched = f"{topic} {enriched}"
+            # Validate and ensure we have queries
+            if not queries or not isinstance(queries, list):
+                # Fallback: create a simple query from the original
+                print(f"DEBUG: No queries list found, creating fallback query")
+                queries = [query]
             
-            print(f"DEBUG: Extracted - Topic: {data.get('topic', 'unknown')}, Enriched: {enriched}")
-            return enriched
+            # Ensure topic is present in at least the first query if provided
+            if topic and queries:
+                first_query_lower = queries[0].lower()
+                if topic not in first_query_lower:
+                    queries[0] = f"{topic} {queries[0]}"
+            
+            # Limit to 5 queries max
+            queries = queries[:5]
+            
+            print(f"DEBUG: Extracted - Topic: {data.get('topic', 'unknown')}, Queries: {queries}")
+            return queries
         except Exception as e:
-            print(f"DEBUG: Extraction failed: {e}. Using original query.")
-            return query  # Fallback to raw query
+            print(f"DEBUG: Extraction failed: {e}. Using original query as single query.")
+            return [query]  # Fallback to single query as list
 
 class QueryEnricher:
     def __init__(self):
@@ -475,59 +534,92 @@ class QueryEnricher:
 def build_search_query(user_query):
     return user_query  # Broad search; trust agent narrows
 
-def search_searxng(query, num_results=5):
-    """Query local SearxNG for restricted results with debugging."""
-    url = "http://localhost:8080/search"
-    # Try multiple engines for robustness
-    engines_to_try = ["google"]
+def search_searxng(queries, num_results_per_query=10):
+    """Query local SearxNG for multiple queries and collect all results.
+    
+    Args:
+        queries: A single query string or a list of query strings
+        num_results_per_query: Maximum number of results to fetch per query (default: 10)
+    
+    Returns:
+        List of unique search results (deduplicated by URL)
+    """
+    # Normalize input: convert single query to list
+    if isinstance(queries, str):
+        queries = [queries]
+    
+    # Use configured SEARXNG_URL so the app works both on localhost and inside docker-compose
+    url = Config.SEARXNG_URL
+    engines_to_try = Config.SEARCH_ENGINES
     all_results = []
     
-    for engine in engines_to_try:
-        params = {
-            "q": query,
-            "format": "json",
-            "engines": engine,
-            "categories": "general",
-            "safesearch": "0"
-        }
-        print(f"DEBUG: Trying engine '{engine}' for query: {query}")  # Debug log
+    # Search for each query
+    for query in queries:
+        print(f"DEBUG: Searching for query: {query}")
+        query_results_found = False
         
-        try:
-            response = requests.get(url, params=params, timeout=10)  # Increased timeout
-            print(f"DEBUG: Response status for {engine}: {response.status_code}")  # Debug
+        # Try engines in order until we get results
+        for engine in engines_to_try:
+            params = {
+                "q": query,
+                "format": "json",
+                "engines": engine,
+                "categories": "general",
+                "safesearch": "0"
+            }
+            print(f"DEBUG: Trying engine '{engine}' for query: {query}")
             
-            if response.status_code == 200:
-                data = response.json()
-                results = data.get("results", [])[:num_results]
-                print(f"DEBUG: Got {len(results)} results from {engine}")  # Debug
-                for r in results:
-                    try:
-                        all_results.append({
-                            "title": r.get("title", "No title"),
-                            "url": r.get("url", ""),
-                            "content": r.get("content", "")
-                        })
-                    except (KeyError, TypeError) as e:
-                        print(f"DEBUG: Error processing result: {e}")
-                        continue
-            else:
-                print(f"DEBUG: Failed {engine} with status {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            print(f"DEBUG: Request error for {engine}: {e}")
-        except json.JSONDecodeError as e:
-            print(f"DEBUG: JSON parse error for {engine}: {e}")
+            try:
+                response = requests.get(url, params=params, timeout=Config.SEARXNG_TIMEOUT)
+                print(f"DEBUG: Response status for {engine}: {response.status_code}")
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get("results", [])
+                    
+                    # Check if we got any results
+                    if results:
+                        results = results[:num_results_per_query]
+                        print(f"DEBUG: Got {len(results)} results from {engine} for query: {query}")
+                        query_results_found = True
+                        
+                        for r in results:
+                            try:
+                                all_results.append({
+                                    "title": r.get("title", "No title"),
+                                    "url": r.get("url", ""),
+                                    "content": r.get("content", ""),
+                                    "query": query,  # Track which query found this result
+                                    "engine": engine  # Track which engine found this result
+                                })
+                            except (KeyError, TypeError) as e:
+                                print(f"DEBUG: Error processing result: {e}")
+                                continue
+                        
+                        # If we got results from this engine, no need to try others for this query
+                        break
+                    else:
+                        print(f"DEBUG: Engine '{engine}' returned 0 results for query: {query}")
+                else:
+                    print(f"DEBUG: Failed {engine} with status {response.status_code} for query: {query}")
+            except requests.exceptions.RequestException as e:
+                print(f"DEBUG: Request error for {engine} on query '{query}': {e}")
+            except json.JSONDecodeError as e:
+                print(f"DEBUG: JSON parse error for {engine} on query '{query}': {e}")
+        
+        if not query_results_found:
+            print(f"DEBUG: WARNING: No results found for query '{query}' from any engine")
     
-    # Dedupe and limit total results
+    # Deduplicate by URL (keep first occurrence)
     seen_urls = set()
     unique_results = []
     for r in all_results:
-        if r["url"] not in seen_urls:
+        url = r.get("url", "")
+        if url and url not in seen_urls:
             unique_results.append(r)
-            seen_urls.add(r["url"])
-        if len(unique_results) >= num_results:
-            break
+            seen_urls.add(url)
     
-    print(f"DEBUG: Final unique results: {len(unique_results)}")  # Debug
+    print(f"DEBUG: Total results collected: {len(all_results)}, Unique results after deduplication: {len(unique_results)}")
     return unique_results
 
 def scrape_with_crawl4ai(urls: List[str], timeout_per_url: int = 30):
@@ -610,12 +702,11 @@ def run_agent():
         user_query = input("Ask (or 'quit'): ")
         if user_query.lower() == 'quit':
             break
-        # Use QueryExtractorAgent to extract and enrich the query
-        enriched_query = query_extractor.extract_and_enrich(user_query)
+        # Use QueryExtractorAgent to extract and enrich the query into multiple focused queries
+        enriched_queries = query_extractor.extract_and_enrich(user_query)
 
-        # Step 1: Broad search (now with enriched query)
-        search_q = build_search_query(enriched_query)  # Pass enriched
-        search_results = search_searxng(search_q)
+        # Step 1: Search with multiple queries (each returns up to 10 results)
+        search_results = search_searxng(enriched_queries, num_results_per_query=10)
 
         if not search_results:
             print("No sources found.")

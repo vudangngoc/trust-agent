@@ -1,0 +1,11 @@
+fastapi>=0.95.0
+uvicorn[standard]>=0.18.0
+pydantic>=1.10.0
+llama-index>=0.10.0
+llama-index-vector-stores-chroma
+llama-index-embeddings-huggingface
+chromadb
+crawl4ai
+python-whois
+requests
+sentence-transformers>=2.2.2

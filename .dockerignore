@@ -1,0 +1,14 @@
+.venv
+__pycache__
+*.pyc
+.git
+.gitignore
+temp_chroma
+*.sqlite3
+.env
+venv/
+build/
+dist/
+*.egg-info
+/.vscode
+/.idea
