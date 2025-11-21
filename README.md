@@ -157,7 +157,7 @@ Minimum trust threshold: **0.7**
 Edit `.env` file:
 
 ```bash
-# Abacus AI RouteLLM
+# Abacus AI RouteLLM or any OpenAI competitive API
 ABACUS_API_KEY=your_api_key_here
 ABACUS_BASE_URL=https://routellm.abacus.ai/v1/
 
