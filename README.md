@@ -1,12 +1,12 @@
-# **Local RAG Agent for PoCs – macOS Setup Guide**  
-**Accurate • Local • No Hallucinations • Official Docs Only**
+# **Trust Agent - RAG Agent with Trust Filtering**  
+**Accurate • Trusted Sources Only • No Hallucinations**
 
-This guide helps **Solution Architects** build a **fully local, open-source RAG agent** on **macOS** that:
-- Searches **only official documentation**
-- Uses **local LLM (Ollama)**
-- **Never hallucinates** (refuses if no source)
-- Works **entirely offline** after setup
-- Handles **niche PoC topics** with precision
+This guide helps you set up and run a **RAG (Retrieval-Augmented Generation) agent** that:
+- Searches **only trusted, official documentation**
+- Uses **Abacus AI RouteLLM** for LLM inference
+- **Never hallucinates** (refuses if no reliable source found)
+- Filters results through a **trust scoring system**
+- Provides answers via **REST API**
 
 ---
 
@@ -14,135 +14,163 @@ This guide helps **Solution Architects** build a **fully local, open-source RAG 
 
 | Component | Tool | Why |
 |--------|------|-----|
-| **LLM** | `ollama` + `phi3:3.8b` | Fast, local, 20+ tokens/sec |
-| **Search** | `SearxNG` (Docker) | Private, domain-restricted |
-| **Scraping** | `crawl4ai` + `Playwright` | JS-heavy docs |
-| **RAG** | `LlamaIndex` | Grounded answers |
-| **Trust & Enrichment** | Heuristic + Fallback | No CSV, adaptive |
+| **LLM** | `Abacus AI RouteLLM` | OpenAI-compatible API, multiple model support |
+| **Search** | `SearxNG` (Docker) | Private, multi-engine search (DuckDuckGo, Google, Bing, Startpage) |
+| **Scraping** | `crawl4ai` + `Playwright` | JS-heavy docs support |
+| **RAG** | `LlamaIndex` | Grounded answers with vector search |
+| **Trust & Enrichment** | Heuristic + LLM-based | Filters to official sources only |
 
 ---
 
-## Prerequisites (macOS)
+## Prerequisites
 
 | Tool | Install |
 |------|--------|
-| **Python 3.12** | [python.org](https://www.python.org/downloads/) or `brew install python@3.12` |
-| **Git** | Pre-installed, or [git-scm.com](https://git-scm.com/download/mac) |
 | **Docker Desktop** | [docker.com](https://www.docker.com/products/docker-desktop/) |
-| **VS Code** (Optional) | [code.visualstudio.com](https://code.visualstudio.com/) |
+| **Git** | [git-scm.com](https://git-scm.com/downloads) |
+| **Abacus AI API Key** | [abacus.ai/app/route-llm-apis](https://abacus.ai/app/route-llm-apis) |
 
-> **Docker Tip**: Docker Desktop for Mac works out of the box.
-
----
-
-## Step-by-Step Setup
-
-### 1. Create Project Folder
-```bash
-mkdir ~/rag-poc
-cd ~/rag-poc
-```
+> **Note**: Works on macOS, Windows, and Linux with Docker Desktop.
 
 ---
 
-### 2. Create Virtual Environment
+## Quick Start
+
+### 1. Clone the Repository
 ```bash
-python3 -m venv rag-agent-env
-source rag-agent-env/bin/activate
+git clone <repository-url>
+cd trust-agent
 ```
 
-> You’ll see `(rag-agent-env)` in your prompt.
+### 2. Configure Environment Variables
+
+Create a `.env` file in the project root:
+
+```bash
+# Abacus AI RouteLLM Configuration
+ABACUS_API_KEY=your_api_key_here
+ABACUS_BASE_URL=https://routellm.abacus.ai/v1/
+```
+
+> **Get your API key**: Visit [abacus.ai/app/route-llm-apis](https://abacus.ai/app/route-llm-apis) to obtain your `ABACUS_API_KEY`.
+
+### 3. Build and Start Services
+
+```bash
+docker-compose up -d --build
+```
+
+This will start:
+- **Trust Agent API** on port `8000`
+- **SearxNG** search engine on port `8080`
+- **Redis** for SearxNG caching
+
+### 4. Verify Services are Running
+
+Check that all containers are up:
+```bash
+docker-compose ps
+```
+
+You should see:
+- `trust-agent-app` (running)
+- `searxng` (running)
+- `searxng-redis` (running)
+
+Test SearxNG: Open http://localhost:8080 in your browser and perform a test search.
 
 ---
 
-### 3. Install Python Packages
+## Usage
+
+### REST API
+
+The Trust Agent exposes a REST API at `http://localhost:8000`.
+
+#### Ask a Question
+
 ```bash
-pip install --upgrade pip
-pip install llama-index llama-index-llms-ollama llama-index-embeddings-huggingface \
-            llama-index-vector-stores-chroma chromadb crawl4ai playwright \
-            requests beautifulsoup4 pandas pypdf python-whois duckduckgo-search
+curl --location 'http://localhost:8000/ask' \
+--header 'Content-Type: application/json' \
+--data '{"question":"What are methods to detect QR code 2D?"}'
 ```
 
-> **Playwright Browsers** (required for scraping):
-```bash
-playwright install chromium
+**Example Request:**
+```json
+{
+  "question": "What are methods to detect QR code 2D?"
+}
 ```
+
+**Example Response:**
+```json
+{
+  "answer": "QR code detection methods include...",
+  "sources": ["[Source: https://example.com/qr-detection]"],
+  "trusted_urls": [
+    "https://docs.opencv.org/qr-detection",
+    "https://github.com/zxing/zxing"
+  ]
+}
+```
+
+#### Response Format
+
+- **`answer`**: The generated answer based on trusted sources
+- **`sources`**: List of formatted source citations
+- **`trusted_urls`**: URLs of trusted sources used
+
+#### Error Responses
+
+- **400 Bad Request**: Invalid input or insufficient trusted sources found
+- **500 Internal Server Error**: Processing error (check logs)
 
 ---
 
-### 4. Install & Start Ollama
-1. Download: [ollama.com](https://ollama.com/download) → Choose macOS installer
-2. Install → Open **Terminal**
-3. Pull model:
-```bash
-ollama pull phi3:3.8b
-```
-4. Start server:
-```bash
-ollama serve
-```
-> Keep this terminal **open**.
+## Architecture
+
+### How It Works
+
+1. **Query Enrichment**: User query is enriched into multiple focused search queries using LLM
+2. **Multi-Engine Search**: Searches across multiple engines (DuckDuckGo, Google, Bing, Startpage) with automatic fallback
+3. **Trust Filtering**: URLs are scored for trustworthiness using heuristics and LLM-based evaluation
+4. **Content Scraping**: Trusted URLs are scraped using Playwright
+5. **Vector Indexing**: Scraped content is indexed in ChromaDB
+6. **Answer Generation**: LLM generates answer based on retrieved context with source citations
+
+### Trust Scoring Criteria
+
+- **HTTPS**: +0.1
+- **Official TLD** (.gov, .edu, .org, .io): +0.2
+- **Official paths** (docs/, guide/, official/): +0.2
+- **Vendor match** (e.g., aws.amazon.com for AWS queries): +0.3
+- **Domain age** and **registrar info** (via LLM evaluation)
+
+Minimum trust threshold: **0.7**
 
 ---
 
-### 5. Start SearxNG (Local Search Engine)
+## Configuration
 
-#### Option A: Docker Compose (Recommended)
+### Environment Variables
+
+Edit `.env` file:
+
 ```bash
-mkdir searxng && cd searxng
+# Abacus AI RouteLLM
+ABACUS_API_KEY=your_api_key_here
+ABACUS_BASE_URL=https://routellm.abacus.ai/v1/
+
+# Optional: Override defaults in dynamic_rag_agent.py
+# LLM_MODEL=gpt-5-mini
+# TRUST_THRESHOLD=0.7
 ```
-Create `docker-compose.yml`:
+
+### SearxNG Configuration
+
+Edit `searxng/settings.yml` to enable/disable search engines:
+
 ```yaml
-version: '3'
-services:
-  caddy:
-    image: caddy:2
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-    depends_on:
-      - searxng
-
-  searxng:
-    image: searxng/searxng:latest
-    volumes:
-      - ./searxng:/etc/searxng
-    environment:
-      - AUTOSAVE=1
-    depends_on:
-      - redis
-
-  redis:
-    image: redis:7-alpine
-    command: redis-server --save 60 1 --loglevel warning
-    volumes:
-      - redis_data:/data
-
-volumes:
-  caddy_data:
-  redis_data:
-```
-
-Create folders:
-```bash
-mkdir -p searxng/caddy
-touch searxng/settings.yml
-```
-
-Edit `searxng/settings.yml`:
-```yaml
-server:
-  secret_key: your-super-secret-key-1234567890  # CHANGE THIS!
-  bind_address: "0.0.0.0"
-  port: 8080
-
-search:
-  formats:
-    - html
-    - json  # REQUIRED
-
 engines:
   - name: duckduckgo
     disabled: false
@@ -150,61 +178,114 @@ engines:
     disabled: false
   - name: bing
     disabled: false
+  - name: startpage
+    disabled: false
 ```
 
-Start:
+### Application Configuration
+
+Edit `dynamic_rag_agent.py` `Config` class to adjust:
+- `LLM_MODEL`: Model to use (gpt-5-mini, gpt-4o, claude-3-5-sonnet, etc.)
+- `TRUST_THRESHOLD`: Minimum trust score (default: 0.7)
+- `SEARCH_ENGINES`: List of engines to try in order
+- `SIMILARITY_TOP_K`: Number of retrieved chunks (default: 5)
+- `SIMILARITY_CUTOFF`: Minimum similarity score (default: 0.4)
+
+---
+
+## Development
+
+### Rebuild After Code Changes
+
 ```bash
-docker compose up -d
+docker-compose up -d --build
 ```
 
-Test: http://localhost:8080 → Search "test" → Should work.
+### View Logs
 
----
-
-### 6. Save Agent Code
-
-Create `dynamic_rag_agent.py` in `~/rag-poc`:
-
-```python
-# [FULL CODE BELOW - COPY & SAVE]
-```
-
-> **See full code at the end of this README**
-
----
-
-### 7. Run the Agent
 ```bash
-cd ~/rag-poc
-source rag-agent-env/bin/activate
-python3 dynamic_rag_agent.py
+# All services
+docker-compose logs -f
+
+# Trust Agent only
+docker-compose logs -f app
+
+# SearxNG only
+docker-compose logs -f searxng
+```
+
+### Stop Services
+
+```bash
+docker-compose down
+```
+
+### Clean Start (Remove Volumes)
+
+```bash
+docker-compose down -v
 ```
 
 ---
 
-## Test Queries
-
-| Query | Expected |
-|------|----------|
-| `tell me about Quarkus` | Official docs from `quarkus.io` |
-| `generate math exercise for grade 3` | From `khanacademy.org` |
-| `how to use AWS Lambda` | `docs.aws.amazon.com` |
-
----
-
-## Troubleshooting (macOS)
+## Troubleshooting
 
 | Error | Cause | Fix |
 |------|-------|-----|
-| `source: command not found` | Using wrong shell | Use `bash` or `zsh` (default on macOS) |
-| `rag-agent-env/bin/activate: No such file` | Venv not created | `python3 -m venv rag-agent-env` |
-| `playwright: Executable doesn't exist` | Browsers not installed | `playwright install chromium` |
-| `Ollama timeout` | Model too slow | Use `phi3:3.8b` or increase `request_timeout=180` |
-| `SearxNG 403 on JSON` | `json` not in `formats` | Add `- json` in `settings.yml` |
-| `secret_key` error | Default key | Change to random string |
-| `Docker port 8080 in use` | Another app | Change to `8081:8080` in `docker-compose.yml` |
-| `python: command not found` | Python not in PATH | Use `python3` instead of `python` |
-| `crawl4ai hangs` | JS site | `playwright install chromium` + `wait_for` in code |
-| `Permission denied` | File permissions | `chmod +x` or check file ownership |
+| `ABACUS_API_KEY not set` | Missing API key | Add `ABACUS_API_KEY` to `.env` file |
+| `Connection refused` on port 8000 | Container not running | `docker-compose up -d` |
+| `0 results from duckduckgo` | Engine issue | System auto-falls back to Google/Bing/Startpage |
+| `playwright: Executable doesn't exist` | Browser not installed | Rebuild image: `docker-compose build` |
+| `SQLite version error` | Old SQLite | Ensure using `python:3.11-slim-bookworm` base image |
+| `ImportError: llama_index.vector_stores.chroma` | Missing package | Check `requirements.txt` includes `llama-index-vector-stores-chroma` |
+| `SearxNG 403 on JSON` | JSON format not enabled | Ensure `searxng/settings.yml` has `formats: [html, json]` |
+| Port 8000 or 8080 in use | Port conflict | Change ports in `docker-compose.yml` |
+
+### Check Container Status
+
+```bash
+docker-compose ps
+docker-compose logs app
+```
+
+### Test SearxNG Directly
+
+```bash
+curl "http://localhost:8080/search?q=test&format=json"
+```
+
+### Verify Environment Variables
+
+```bash
+docker-compose exec app env | grep ABACUS
+```
 
 ---
+
+## Project Structure
+
+```
+trust-agent/
+├── docker-compose.yml          # Docker services configuration
+├── Dockerfile                  # Trust Agent container image
+├── .env                        # Environment variables (create this)
+├── requirements.txt            # Python dependencies
+├── dynamic_rag_agent.py       # Core RAG agent logic
+├── rest_api.py                # FastAPI REST endpoint
+├── searxng/
+│   ├── settings.yml           # SearxNG configuration
+│   └── data/                  # SearxNG data directory
+└── temp_chroma/               # ChromaDB vector store (created at runtime)
+```
+
+---
+
+## API Documentation
+
+For detailed API documentation, see [API_README.md](API_README.md).
+
+---
+
+## License
+
+See [LICENSE](LICENSE) file for details.
